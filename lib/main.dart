@@ -1,9 +1,8 @@
 // main.dart
 import 'dart:io';
-import 'dart:typed_data';
-
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:pdf/widgets.dart' as pw;
@@ -11,6 +10,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_pdfview/flutter_pdfview.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:path/path.dart' as p;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -79,30 +79,71 @@ class _HomePageState extends State<HomePage> {
       await outputDir.create(recursive: true);
     }
 
+    // Compression settings (tweak to taste)
+    const int quality = 65;     // 40-80 recommended. Lower = smaller file.
+    const int minWidth = 1200;  // target width in px (maintains aspect ratio)
+
     for (int i = 0; i < photos.length; i++) {
       final XFile photo = photos[i];
-      final Uint8List imageBytes = await photo.readAsBytes();
 
-      final pdf = pw.Document();
-      final image = pw.MemoryImage(imageBytes);
+      // Read original bytes
+      Uint8List originalBytes;
+      try {
+        originalBytes = await photo.readAsBytes();
+      } catch (e) {
+        debugPrint('Failed to read image bytes for ${photo.path}: $e');
+        continue; // skip this image
+      }
 
-      pdf.addPage(
-        pw.Page(
-          build: (pw.Context context) {
-            return pw.Center(child: pw.Image(image, fit: pw.BoxFit.contain));
-          },
-        ),
-      );
+      // Compress (fallback to original if compression fails)
+      Uint8List compressedBytes;
+      print("originalBytes, ${originalBytes}");
+      try {
+        final comp = await FlutterImageCompress.compressWithList(
+          originalBytes,
+          quality: quality,
+          minWidth: minWidth,
+          // minHeight: null // keep aspect ratio; plugin accepts null in some versions
+        );
+        compressedBytes = comp.isNotEmpty ? comp : originalBytes;
+        print("comp, ${comp}");
+      } catch (e) {
+        debugPrint('Compression failed for ${photo.path}: $e');
+        compressedBytes = originalBytes;
+      }
 
-      final fileName =
-          '${baseName.trim().isEmpty ? 'file' : baseName}_${i + 1}.pdf';
-      final filePath = '${outputDir.path}/$fileName';
-      final outFile = File(filePath);
-      await outFile.writeAsBytes(await pdf.save());
-      createdPaths.add(filePath);
+      // Create PDF document (single page) with compressed image
+      try {
+        final pdf = pw.Document();
+        final image = pw.MemoryImage(compressedBytes);
+
+        pdf.addPage(
+          pw.Page(
+            build: (pw.Context ctx) {
+              return pw.Center(
+                child: pw.Image(image, fit: pw.BoxFit.contain),
+              );
+            },
+          ),
+        );
+
+        final safeBase = baseName.trim().isEmpty ? 'file' : baseName.trim();
+        final fileName = '${safeBase}_${i + 1}.pdf';
+        final filePath = p.join(outputDir.path, fileName);
+        final outFile = File(filePath);
+        final pdfBytes = await pdf.save();
+        await outFile.writeAsBytes(pdfBytes, flush: true);
+        createdPaths.add(filePath);
+        debugPrint('Created PDF: $filePath (image ${i + 1}/${photos.length})');
+      } catch (e) {
+        debugPrint('Failed to create PDF for ${photo.path}: $e');
+        // skip this one but continue others
+      }
     }
+
     return createdPaths;
   }
+
 
   Future<void> _generatePdfs() async {
     if (_photos.isEmpty) {
@@ -177,16 +218,12 @@ class _HomePageState extends State<HomePage> {
       _showSnack('Please enter recipient email.');
       return;
     }
-
-    // ✅ Step 1: Share PDFs via Gmail
     await Share.shareXFiles(
       attachments.map((path) => XFile(path)).toList(), // ✅ convert string → XFile
       subject: 'Valuation PDFs - ${_baseNameController.text}',
       text: 'Attached are the PDF reports.\nTo: $email',
     );
 
-
-    // ✅ Step 2: (Optional) Open Gmail compose pre-filled
     final Uri emailUri = Uri(
       scheme: 'mailto',
       path: email,
