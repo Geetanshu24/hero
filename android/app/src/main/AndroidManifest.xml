@@ -33,12 +33,23 @@
             </intent-filter>
         </activity>
 
+        <!-- FileProvider for sharing cached/internal files with other apps -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true"
+            tools:replace="android:authorities">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/provider_paths" />
+        </provider>
+
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
     </application>
 
-    <!-- Keep the queries section as is -->
     <queries>
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>

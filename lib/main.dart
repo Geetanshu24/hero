@@ -1,7 +1,10 @@
 // main.dart
 import 'dart:io';
+import 'dart:typed_data';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_image_compress/flutter_image_compress.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -11,7 +14,7 @@ import 'package:flutter_pdfview/flutter_pdfview.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:path/path.dart' as p;
-
+import 'package:android_intent_plus/android_intent.dart';
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const MyApp());
@@ -45,6 +48,8 @@ class _HomePageState extends State<HomePage> {
   bool _isProcessing = false;
   final Map<String, bool> _selected = {}; // path -> selected
 
+  final MethodChannel _channel = const MethodChannel('app.channel.shared/files');
+  // ---------- permissions & photo ----------
   Future<void> _requestPermissions() async {
     await [
       Permission.camera,
@@ -66,7 +71,40 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // Convert each photo to a PDF and return list of PDF file paths
+  Future<bool> _sendEmailNative({
+    required String recipient,
+    required String subject,
+    required String body,
+    required List<String> filePaths,
+  }) async {
+    try {
+      final args = {
+        'to': [recipient],
+        'subject': subject,
+        'body': body,
+        'paths': filePaths,
+      };
+      final res = await _channel.invokeMethod('sendEmailWithAttachments', args);
+      return res == true;
+    } on PlatformException catch (e) {
+      debugPrint('Native email send failed: ${e.code} ${e.message}');
+      return false;
+    } catch (e) {
+      debugPrint('Native email send unexpected: $e');
+      return false;
+    }
+  }
+
+  // ---------- helper: format bytes ----------
+  String formatBytes(int bytes, [int decimals = 2]) {
+    if (bytes <= 0) return "0 B";
+    const suffixes = ["B", "KB", "MB", "GB", "TB"];
+    final i = (log(bytes) / log(1024)).floor();
+    final value = bytes / pow(1024, i);
+    return "${value.toStringAsFixed(decimals)} ${suffixes[i]}";
+  }
+
+  // ---------- create single-page PDFs (1 per image), compressed ----------
   Future<List<String>> _createPdfsFromPhotos({
     required List<XFile> photos,
     required String baseName,
@@ -79,40 +117,45 @@ class _HomePageState extends State<HomePage> {
       await outputDir.create(recursive: true);
     }
 
-    // Compression settings (tweak to taste)
-    const int quality = 65;     // 40-80 recommended. Lower = smaller file.
-    const int minWidth = 1200;  // target width in px (maintains aspect ratio)
+    // Compression settings
+    const int quality = 65; // 40-80 recommended
+    const int minWidth = 1200;
 
     for (int i = 0; i < photos.length; i++) {
       final XFile photo = photos[i];
 
-      // Read original bytes
+      // read bytes
       Uint8List originalBytes;
       try {
         originalBytes = await photo.readAsBytes();
       } catch (e) {
         debugPrint('Failed to read image bytes for ${photo.path}: $e');
-        continue; // skip this image
+        continue;
       }
 
-      // Compress (fallback to original if compression fails)
+      // compress with safe fallback if plugin missing or fails
       Uint8List compressedBytes;
-      print("originalBytes, ${originalBytes}");
       try {
-        final comp = await FlutterImageCompress.compressWithList(
-          originalBytes,
-          quality: quality,
-          minWidth: minWidth,
-          // minHeight: null // keep aspect ratio; plugin accepts null in some versions
-        );
-        compressedBytes = comp.isNotEmpty ? comp : originalBytes;
-        print("comp, ${comp}");
+        if (Platform.isAndroid || Platform.isIOS) {
+
+          final comp = await FlutterImageCompress.compressWithList(
+            originalBytes,
+            quality: quality,
+            minWidth: minWidth,
+          );
+          compressedBytes = (comp != null && comp.isNotEmpty) ? comp : originalBytes;
+        } else {
+          compressedBytes = originalBytes;
+        }
+      } on MissingPluginException catch (mp) {
+        debugPrint('Image compress plugin not found: $mp — using original bytes');
+        compressedBytes = originalBytes;
       } catch (e) {
         debugPrint('Compression failed for ${photo.path}: $e');
         compressedBytes = originalBytes;
       }
 
-      // Create PDF document (single page) with compressed image
+      // make pdf single page
       try {
         final pdf = pw.Document();
         final image = pw.MemoryImage(compressedBytes);
@@ -120,9 +163,7 @@ class _HomePageState extends State<HomePage> {
         pdf.addPage(
           pw.Page(
             build: (pw.Context ctx) {
-              return pw.Center(
-                child: pw.Image(image, fit: pw.BoxFit.contain),
-              );
+              return pw.Center(child: pw.Image(image, fit: pw.BoxFit.contain));
             },
           ),
         );
@@ -134,17 +175,16 @@ class _HomePageState extends State<HomePage> {
         final pdfBytes = await pdf.save();
         await outFile.writeAsBytes(pdfBytes, flush: true);
         createdPaths.add(filePath);
-        debugPrint('Created PDF: $filePath (image ${i + 1}/${photos.length})');
+        debugPrint('Created PDF: $filePath  size=${formatBytes(pdfBytes.length)}');
       } catch (e) {
         debugPrint('Failed to create PDF for ${photo.path}: $e');
-        // skip this one but continue others
       }
     }
 
     return createdPaths;
   }
 
-
+  // ---------- generate pdfs and update state ----------
   Future<void> _generatePdfs() async {
     if (_photos.isEmpty) {
       _showSnack('Take at least one photo first.');
@@ -152,19 +192,15 @@ class _HomePageState extends State<HomePage> {
     }
     setState(() => _isProcessing = true);
     try {
-      final baseName = _baseNameController.text.isEmpty
-          ? 'logical_reasoning'
-          : _baseNameController.text;
-      final paths = await _createPdfsFromPhotos(
-        photos: List<XFile>.from(_photos),
-        baseName: baseName,
-      );
+      final baseName =
+      _baseNameController.text.isEmpty ? 'logical_reasoning' : _baseNameController.text;
+      final paths = await _createPdfsFromPhotos(photos: List<XFile>.from(_photos), baseName: baseName);
 
       // confirm files exist
       final existPaths = <String>[];
-      for (final p in paths) {
-        final f = File(p);
-        if (await f.exists()) existPaths.add(p);
+      for (final pth in paths) {
+        final f = File(pth);
+        if (await f.exists()) existPaths.add(pth);
       }
 
       setState(() {
@@ -177,6 +213,8 @@ class _HomePageState extends State<HomePage> {
       });
 
       _showSnack('Created ${existPaths.length} PDFs.');
+      // Optionally show sizes
+      await _showPdfSizesDialog(context, existPaths);
     } catch (e) {
       _showSnack('Error creating PDFs: $e');
     } finally {
@@ -184,14 +222,98 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  // Preview screen for a PDF file path
+  // ---------- preview ----------
   void _openPdfViewer(String path) {
-    Navigator.of(context).push(MaterialPageRoute(
-      builder: (_) => PdfPreviewScreen(filePath: path),
-    ));
+    Navigator.of(context).push(MaterialPageRoute(builder: (_) => PdfPreviewScreen(filePath: path)));
   }
 
-  // Send selected PDFs through email (flutter_email_sender)
+  // ---------- copy file to cache (for FileProvider) ----------
+  Future<String> _copyToCacheAndReturn(String srcPath) async {
+    final srcFile = File(srcPath);
+    if (!await srcFile.exists()) throw Exception('Source file missing');
+    final cacheDir = await getTemporaryDirectory();
+    final destPath = p.join(cacheDir.path, p.basename(srcPath));
+    final destFile = File(destPath);
+    await destFile.writeAsBytes(await srcFile.readAsBytes(), flush: true);
+    return destFile.path;
+  }
+
+  // ---------- show sizes dialog ----------
+  Future<List<Map<String, dynamic>>> _getPdfFilesInfo(List<String> paths) async {
+    final List<Map<String, dynamic>> info = [];
+    for (final pth in paths) {
+      final f = File(pth);
+      if (!await f.exists()) continue;
+      final stat = await f.stat();
+      final size = stat.size;
+      final modified = stat.modified;
+      info.add({
+        'path': pth,
+        'name': pth.split('/').last,
+        'sizeBytes': size,
+        'sizeFormatted': formatBytes(size),
+        'modified': modified,
+      });
+    }
+    return info;
+  }
+
+  Future<void> _showPdfSizesDialog(BuildContext context, List<String> paths) async {
+    final info = await _getPdfFilesInfo(paths);
+    if (info.isEmpty) {
+      _showSnack('No PDF files found.');
+      return;
+    }
+
+    int totalBytes = 0;
+    for (final f in info) totalBytes += (f['sizeBytes'] as int);
+
+    await showDialog(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: Text('PDFs (${info.length}) — Total ${formatBytes(totalBytes)}'),
+          content: SizedBox(
+            width: double.maxFinite,
+            child: ListView.separated(
+              shrinkWrap: true,
+              itemCount: info.length,
+              separatorBuilder: (_, __) => const Divider(height: 8),
+              itemBuilder: (context, i) {
+                final f = info[i];
+                final name = f['name'] as String;
+                final size = f['sizeFormatted'] as String;
+                final modified = f['modified'] as DateTime;
+                final modifiedStr =
+                    "${modified.year}-${modified.month.toString().padLeft(2, '0')}-${modified.day.toString().padLeft(2, '0')} ${modified.hour.toString().padLeft(2, '0')}:${modified.minute.toString().padLeft(2, '0')}";
+                return ListTile(
+                  dense: true,
+                  title: Text(name, style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
+                  subtitle: Text('$size • $modifiedStr', style: const TextStyle(fontSize: 12)),
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Close')),
+            TextButton(
+              onPressed: () {
+                final summary = StringBuffer();
+                summary.writeln('PDFs (${info.length}) — Total ${formatBytes(totalBytes)}');
+                for (final f in info) {
+                  summary.writeln('${f['name']} — ${f['sizeFormatted']} — ${f['modified']}');
+                }
+                Share.share(summary.toString(), subject: 'PDFs summary');
+              },
+              child: const Text('Share'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // ---------- send selected PDFs (native composer with To: + attachments) ----------
   Future<void> _sendSelectedPdfs() async {
     final attachments = _pdfPaths.where((p) => _selected[p] == true).toList();
     if (attachments.isEmpty) {
@@ -199,47 +321,79 @@ class _HomePageState extends State<HomePage> {
       return;
     }
 
-    // ✅ Ensure files exist and are PDFs
-    for (var p in attachments) {
-      final f = File(p);
-      if (!await f.exists()) {
-        _showSnack('Missing file: $p');
-        return;
+    // validate & copy to cache (FileProvider-friendly)
+    final List<String> sharedPaths = [];
+    try {
+      for (var pth in attachments) {
+        final f = File(pth);
+        if (!await f.exists()) {
+          _showSnack('Missing file: $pth');
+          return;
+        }
+        // simple PDF header check
+        final headerBytes = await f.openRead(0, 4).first;
+        final header = String.fromCharCodes(headerBytes);
+        if (!header.startsWith('%PDF')) {
+          _showSnack('Not a valid PDF: ${p.basename(pth)}');
+          return;
+        }
+
+        final copied = await _copyToCacheAndReturn(pth);
+        sharedPaths.add(copied);
       }
-      final header = String.fromCharCodes(await f.openRead(0, 4).first);
-      if (!header.startsWith('%PDF')) {
-        _showSnack('Not a valid PDF: $p');
-        return;
-      }
+    } catch (e) {
+      _showSnack('Failed prepare attachments: $e');
+      return;
     }
 
-    final email = _emailController.text.trim();
-    if (email.isEmpty) {
+    final recipient = _emailController.text.trim();
+    if (recipient.isEmpty) {
       _showSnack('Please enter recipient email.');
       return;
     }
-    await Share.shareXFiles(
-      attachments.map((path) => XFile(path)).toList(), // ✅ convert string → XFile
-      subject: 'Valuation PDFs - ${_baseNameController.text}',
-      text: 'Attached are the PDF reports.\nTo: $email',
-    );
 
-    final Uri emailUri = Uri(
-      scheme: 'mailto',
-      path: email,
-      queryParameters: {
-        'subject': 'Valuation PDFs - ${_baseNameController.text}',
-        'body': 'Attached are the generated PDF reports.',
-      },
-    );
+    final subject = 'Photos PDFs - ${_baseNameController.text}';
+    final body = 'Attached are the generated PDF reports.';
+
     try {
-      await launchUrl(emailUri, mode: LaunchMode.externalApplication);
+      if (Platform.isAndroid) {
+        final success = await _sendEmailNative(
+          recipient: recipient,
+          subject: subject,
+          body: body,
+          filePaths: sharedPaths, // paths copied to cache earlier
+        );
+        if (success) return;
+
+        debugPrint('Native send reported failure — falling back to Share');
+        return;
+      }
+
+      // if (Platform.isIOS) {
+      //   final email = Email(
+      //     body: body,
+      //     subject: subject,
+      //     recipients: [recipient],
+      //     attachmentPaths: sharedPaths,
+      //     isHTML: false,
+      //   );
+      //   await FlutterEmailSender.send(email);
+      //   return;
+      // }
+
+      // fallback for web/desktop: share + mailto
+      await Share.shareXFiles(
+        sharedPaths.map((p) => XFile(p)).toList(),
+        subject: subject,
+        text: '$body\n\nTo: $recipient',
+      );
     } catch (e) {
-      debugPrint('Could not open Gmail compose: $e');
+      debugPrint('Error sending email: $e');
+      _showSnack('Error sending email: $e');
     }
   }
 
-
+  // ---------- rest UI helpers ----------
   void _clearAll() {
     setState(() {
       _photos.clear();
@@ -260,6 +414,7 @@ class _HomePageState extends State<HomePage> {
     super.dispose();
   }
 
+  // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
     final columns = 3;
@@ -331,7 +486,8 @@ class _HomePageState extends State<HomePage> {
                 return Stack(children: [
                   ClipRRect(
                     borderRadius: BorderRadius.circular(8),
-                    child: Image.file(File(_photos[i].path), fit: BoxFit.cover, width: double.infinity, height: double.infinity),
+                    child: Image.file(File(_photos[i].path),
+                        fit: BoxFit.cover, width: double.infinity, height: double.infinity),
                   ),
                   Positioned(
                     top: 6,
@@ -355,18 +511,18 @@ class _HomePageState extends State<HomePage> {
                 : ListView.builder(
               itemCount: _pdfPaths.length,
               itemBuilder: (context, index) {
-                final p = _pdfPaths[index];
-                final name = p.split('/').last;
-                final selected = _selected[p] ?? false;
+                final pth = _pdfPaths[index];
+                final name = pth.split('/').last;
+                final selected = _selected[pth] ?? false;
                 return ListTile(
                   leading: Checkbox(
                     value: selected,
-                    onChanged: (v) => setState(() => _selected[p] = v ?? false),
+                    onChanged: (v) => setState(() => _selected[pth] = v ?? false),
                   ),
                   title: Text(name),
                   trailing: IconButton(
                     icon: const Icon(Icons.visibility),
-                    onPressed: () => _openPdfViewer(p),
+                    onPressed: () => _openPdfViewer(pth),
                   ),
                 );
               },
@@ -378,7 +534,7 @@ class _HomePageState extends State<HomePage> {
   }
 }
 
-// Simple PDF preview page using flutter_pdfview
+// PDF preview page
 class PdfPreviewScreen extends StatefulWidget {
   final String filePath;
   const PdfPreviewScreen({super.key, required this.filePath});
@@ -418,8 +574,7 @@ class _PdfPreviewScreenState extends State<PdfPreviewScreen> {
             ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('PDF error: $error')));
           },
         ),
-        if (!isReady)
-          const Center(child: CircularProgressIndicator()),
+        if (!isReady) const Center(child: CircularProgressIndicator()),
       ]),
     );
   }
